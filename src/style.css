@@ -723,3 +723,23 @@ table.controls td:first-child {
   color: var(--yellow);
   font-weight: 800;
 }
+
+/* ───────── 복구 불가 오류 안내 ───────── */
+.screen-fatal {
+  justify-content: center;
+}
+.fatal-detail {
+  max-width: min(720px, 100%);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(255, 43, 90, 0.08);
+  border: 1px solid rgba(255, 43, 90, 0.4);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: #ffb3c4;
+  font-size: 13px;
+  user-select: text;
+}
+.screen-fatal p {
+  margin: 0;
+}
