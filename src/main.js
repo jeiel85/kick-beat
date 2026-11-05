@@ -21,10 +21,27 @@ import { SNEAKERS, isUnlocked, sneakerById } from './game/sneakers.js';
 import { validateGhost } from './game/ghost.js';
 import { Hud } from './ui/hud.js';
 import { Menus } from './ui/menus.js';
+import { WEBGL_HELP, showFatal, webgl2Available } from './ui/fatal.js';
 import { loadGhost, loadSave, recordResult, storeGhost, totalStars, writeSave } from './save.js';
 
 const canvas = document.getElementById('game');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+const menuRoot = document.getElementById('menu');
+
+// WebGL2가 없거나 컨텍스트 생성이 실패하면 빈 화면 대신 원인과 해결 방법을 보여 주고 부팅을 멈춘다.
+// (모듈 최상위에서 다시 던져 이후 초기화가 실행되지 않게 한다 — 오류는 콘솔에도 그대로 남는다)
+function createRenderer() {
+  if (!webgl2Available()) {
+    showFatal(menuRoot, { title: '3D 그래픽을 시작할 수 없습니다', lines: WEBGL_HELP });
+    throw new Error('WebGL2를 사용할 수 없어 시작을 중단했다');
+  }
+  try {
+    return new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+  } catch (e) {
+    showFatal(menuRoot, { title: '3D 그래픽을 시작할 수 없습니다', lines: WEBGL_HELP, error: e });
+    throw e;
+  }
+}
+const renderer = createRenderer();
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
@@ -77,7 +94,7 @@ const app = {
   custom: null, // {buffer, analysis, name}
   calib: null,
 };
-const menus = new Menus(document.getElementById('menu'), app);
+const menus = new Menus(menuRoot, app);
 
 function quality() {
   return save.settings.quality;
@@ -436,6 +453,46 @@ let last = performance.now();
 let deadShown = false;
 function frame(now) {
   requestAnimationFrame(frame);
+  if (app.state === 'error') return; // 오류 화면에서는 실패한 갱신·렌더를 반복하지 않는다
+  try {
+    step(now);
+  } catch (e) {
+    onFrameError(e);
+  }
+}
+
+// 프레임 처리 중 예외: 같은 오류가 매 프레임 반복되며 화면이 굳는 대신, 멈추고 알리고 복구 수단을 준다
+function onFrameError(e) {
+  console.error('[frame] 게임 루프 오류 — 세션을 멈춘다', e);
+  const hadSession = !!app.current;
+  app.state = 'error';
+  input.enabled = false;
+  input.exitLock();
+  hud.show(false);
+  audio.bulletTime(false);
+  showFatal(menuRoot, {
+    title: '게임 진행 중 오류가 발생했습니다',
+    lines: ['이번 판을 멈췄습니다. 다시 시작하면 대부분 이어서 플레이할 수 있습니다.', '같은 오류가 반복되면 아래 내용을 저장소 이슈로 알려 주세요.'],
+    error: e,
+    actions: [
+      ...(hadSession ? [{ label: '이 스테이지 다시 시작', onClick: () => recover(true) }] : []),
+      { label: '메뉴로', onClick: () => recover(false) },
+    ],
+  });
+}
+
+function recover(restart) {
+  menuRoot.classList.remove('on');
+  app.state = 'menu';
+  try {
+    if (restart && app.current) app.restart();
+    else app.quitToMenu();
+  } catch (e) {
+    onFrameError(e);
+  }
+}
+
+function step(now) {
   const realDt = Math.min(0.05, (now - last) / 1000);
   last = now;
   input.pollGamepad();

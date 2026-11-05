@@ -1,6 +1,6 @@
 {
   "name": "kick-beat",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Rhythm-reactive door-kicking FPS for the browser. Kick on the beat for bullet time.",
   "type": "module",
