@@ -32,13 +32,22 @@ describe('judge', () => {
 });
 
 // 합성 트랙: 킥(50~60Hz 감쇠 사인) + 오프비트 하이햇(고역 잡음) + 배경 잡음
-function synthTrack({ bpm, offset, seconds, sr = 22050, hats = true, seed = 1 }) {
+// segments=[[bpm, 초], ...]를 주면 구간마다 템포가 바뀐다(박 시각은 구간 경계에서 끊기지 않고 이어진다).
+function synthTrack({ bpm, offset, seconds, segments, sr = 22050, hats = true, seed = 1 }) {
   const rng = mulberry32(seed);
-  const n = Math.floor(seconds * sr);
+  const segs = segments ?? [[bpm, seconds]];
+  const total = segs.reduce((s, [, sec]) => s + sec, 0);
+  const n = Math.floor(total * sr);
   const out = new Float32Array(n);
-  const period = 60 / bpm;
   for (let i = 0; i < n; i++) out[i] = (rng.next() - 0.5) * 0.02;
-  for (let t = offset; t < seconds; t += period) {
+  const beats = [];
+  let t = offset;
+  let end = 0;
+  for (const [b, sec] of segs) {
+    end += sec;
+    for (; t < end; t += 60 / b) beats.push([t, 60 / b]);
+  }
+  for (const [t, period] of beats) {
     const s0 = Math.floor(t * sr);
     for (let k = 0; k < sr * 0.18 && s0 + k < n; k++) {
       const tt = k / sr;
@@ -78,8 +87,57 @@ describe('analyzeBeats', () => {
       expect(worst).toBeLessThan(25);
       expect(r.loopEnd).toBeGreaterThan(r.loopStart);
       expect(r.energies.length).toBe(12);
+      expect(r.tempoStable).toBe(true);
+      expect(r.unstableFrom).toBeNull();
     });
   }
+
+  describe('곡 중간 템포 변화 감지', () => {
+    it('고정 템포 2분 곡은 경고하지 않고 신뢰도도 그대로다', () => {
+      const { samples, sr } = synthTrack({ bpm: 150, offset: 0.1, seconds: 120, seed: 7 });
+      const r = analyzeBeats(samples, sr);
+      expect(r.bpm).toBeCloseTo(150, 0);
+      expect(r.tempoStable).toBe(true);
+      expect(r.unstableFrom).toBeNull();
+      expect(r.confidence).toBeGreaterThan(0.9);
+    });
+
+    it('140→170(각 60초)은 바뀐 지점 근처부터 어긋난다고 알리고 신뢰도를 낮춘다', () => {
+      const { samples, sr } = synthTrack({ segments: [[140, 60], [170, 60]], offset: 0.2, seed: 11 });
+      const r = analyzeBeats(samples, sr);
+      // 격자는 앞 구간(140)에 맞는다 — 그래서 고정 격자만으로는 신뢰도가 100%로 나오던 곡
+      expect(r.bpm).toBeCloseTo(140, 0);
+      expect(r.tempoStable).toBe(false);
+      expect(r.unstableFrom).toBeGreaterThan(45);
+      expect(r.unstableFrom).toBeLessThan(75);
+      expect(r.confidence).toBeLessThan(0.7);
+    });
+
+    it('150→75→150 하프타임 브레이크는 격자 위에 얹히므로 경고하지 않는다', () => {
+      const { samples, sr } = synthTrack({ segments: [[150, 45], [75, 30], [150, 45]], offset: 0.05, seed: 13 });
+      const r = analyzeBeats(samples, sr);
+      expect(r.bpm).toBeCloseTo(150, 0);
+      expect(r.tempoStable).toBe(true);
+      expect(r.confidence).toBeGreaterThan(0.9);
+    });
+
+    it('150→300(더블타임)→150도 격자 위에 얹히므로 경고하지 않는다', () => {
+      const { samples, sr } = synthTrack({ segments: [[150, 45], [300, 30], [150, 45]], offset: 0.05, hats: false, seed: 17 });
+      const r = analyzeBeats(samples, sr);
+      expect(r.bpm).toBeCloseTo(150, 0);
+      expect(r.tempoStable).toBe(true);
+    });
+
+    it('템포는 같아도 멈춤 뒤 박이 밀리면(0.3박) 알린다', () => {
+      // 앞 60초의 격자는 0.1 + 0.4k초. 뒤 60초는 0.22 + 0.4k초로 시작 → 같은 템포지만 박이 120ms 밀린다
+      const a = synthTrack({ bpm: 150, offset: 0.1, seconds: 60, seed: 19 }).samples;
+      const b = synthTrack({ bpm: 150, offset: 0.22, seconds: 60, seed: 23 }).samples;
+      const samples = new Float32Array(a.length + b.length);
+      samples.set(a);
+      samples.set(b, a.length);
+      expect(analyzeBeats(samples, 22050).tempoStable).toBe(false);
+    });
+  });
 
   it('무음은 오류로 알린다', () => {
     expect(() => analyzeBeats(new Float32Array(22050 * 10), 22050)).toThrow();
