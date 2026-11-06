@@ -1,5 +1,5 @@
 // 커스텀 음악 비트 분석: 저역(킥 드럼) 에너지의 온셋 → 자기상관으로 템포 후보 → 위상 접기(fold)로 BPM·첫 박 정밀화.
-// 순수 함수라 Node 테스트에서 합성 신호로 검증한다.
+// 찾은 격자가 곡 전체에서 맞는지(중간에 템포가 바뀌지 않는지)도 창별로 확인한다. 순수 함수라 Node 테스트에서 합성 신호로 검증한다.
 
 const HOP_SEC = 0.01;
 const FOLD_BINS = 96;
@@ -96,7 +96,7 @@ function foldScore(on, bpm, hopSec, bins = FOLD_BINS) {
   const denom = l - 2 * best + r;
   const shift = denom !== 0 ? (0.5 * (l - r)) / denom : 0;
   const phase = (((bestBin + 0.5 + shift) / bins) % 1 + 1) % 1;
-  return { score: mean > 0 ? best / mean : 0, phase };
+  return { score: mean > 0 ? best / mean : 0, phase, sm };
 }
 
 function autocorrCandidates(on, maxFrames, hopSec) {
@@ -126,10 +126,117 @@ function foldBest(on, lo, hi, step, hopSec) {
   return best;
 }
 
+// ───────── 템포 안정성 ─────────
+// 격자는 BPM 하나로 곡 끝까지 이어지므로, 곡 중간에 템포가 바뀌거나 흔들리면 그 뒤 박이 어긋난다.
+// 곡 전체를 창으로 나눠 창마다 두 가지를 본다.
+//  ① 템포: 온셋을 8분음표 주기로 접은 원형 평균 크기(한 위상에 몰리면 1, 흩어지면 0)가 창 안에서 가장 잘 맞는
+//     템포보다 크게 낮으면 템포가 다르다. 8분음표 기준이라 하프타임(박 하나 건너)·더블타임(반박 추가)은 맞는 것으로 본다.
+//  ② 위상: 템포가 같아도 박이 밀렸으면(흔들림·멈춤 뒤 재시작) 접은 히스토그램의 박·반박 자리에 봉우리가 없다.
+const STAB_WIN_SEC = 16;
+const STAB_HOP_SEC = 8;
+const STAB_TOL_SEC = 0.035; // 격자 자리 허용 오차(PERFECT ±50ms의 70%)
+const STAB_CLEAR = 0.4; // 창 안 최적 템포의 원형 평균이 이 미만이면 박이 뚜렷하지 않은 구간 → 판단 보류
+const STAB_FIT = 0.5; // 찾은 격자의 원형 평균이 창 안 최적 템포의 이 비율 미만이면 템포가 다르다
+const STAB_ON_GRID = 0.5; // 박·반박 자리 봉우리가 히스토그램 정점의 이 비율 미만이면 박이 밀렸다
+const STAB_QUIET = 0.25; // 창 온셋 총량이 곡 중앙값의 이 비율 미만이면 조용한 구간으로 보고 건너뛴다
+const STAB_RUN = 2; // 연속으로 이만큼 어긋난 창이 나와야 경고(필인·전환 한두 마디는 무시)
+const STAB_BINS = 64;
+const STAB_COS = Float64Array.from({ length: STAB_BINS }, (_, b) => Math.cos((2 * Math.PI * (b + 0.5)) / STAB_BINS));
+const STAB_SIN = Float64Array.from({ length: STAB_BINS }, (_, b) => Math.sin((2 * Math.PI * (b + 0.5)) / STAB_BINS));
+
+// 8분음표 주기 Q(프레임)로 접은 온셋의 원형 평균 크기. 박·반박 어디에 몰려도 같은 위상이 된다.
+// 히스토그램으로 모아 계산해 템포 후보 수백 개를 훑어도 싸다.
+function eighthFit(seg, Q, hist) {
+  hist.fill(0);
+  let tot = 0;
+  for (let i = 0; i < seg.length; i++) {
+    const v = seg[i];
+    if (v === 0) continue;
+    hist[Math.floor(((i % Q) / Q) * STAB_BINS) % STAB_BINS] += v;
+    tot += v;
+  }
+  let re = 0;
+  let im = 0;
+  for (let b = 0; b < STAB_BINS; b++) {
+    re += hist[b] * STAB_COS[b];
+    im += hist[b] * STAB_SIN[b];
+  }
+  return tot > 0 ? Math.hypot(re, im) / tot : 0;
+}
+
+/**
+ * @returns {{tempoStable:boolean, unstableFrom:number|null, fitRatio:number}}
+ *   unstableFrom: 격자가 음악과 어긋나기 시작하는 대략의 시각(초). fitRatio: 박이 뚜렷한 창 중 격자와 맞는 비율.
+ */
+export function tempoStability(on, hopSec, bpm, offset) {
+  const P = 60 / bpm / hopSec; // 박 주기(프레임)
+  const expect = ((offset / hopSec / P) % 1 + 1) % 1; // 곡 전체 기준 첫 박의 위상
+  const tolPh = STAB_TOL_SEC / hopSec / P;
+  const winF = Math.round(STAB_WIN_SEC / hopSec);
+  const hopF = Math.round(STAB_HOP_SEC / hopSec);
+  const n = on.length;
+  const starts = [];
+  for (let a = 0; a + winF <= n; a += hopF) starts.push(a);
+  if (starts.length === 0) starts.push(0);
+  else if (n - (starts[starts.length - 1] + winF) > hopF / 2) starts.push(n - winF);
+
+  const wins = starts.map((a) => {
+    const seg = on.subarray(a, a + winF);
+    let tot = 0;
+    for (let i = 0; i < seg.length; i++) tot += seg[i];
+    return { a, seg, tot };
+  });
+  const tots = wins.map((w) => w.tot).sort((x, y) => x - y);
+  const median = tots[Math.floor(tots.length / 2)];
+  const hist = new Float64Array(STAB_BINS);
+
+  let clear = 0;
+  let bad = 0;
+  let run = 0;
+  let runStart = 0;
+  let unstableFrom = null;
+  for (let w = 0; w < wins.length; w++) {
+    const { a, seg, tot } = wins[w];
+    if (!(tot > 0) || tot < median * STAB_QUIET) continue;
+    let best = 0;
+    for (let b = BPM_MIN * 0.97; b <= BPM_MAX * 1.03; b += 0.5) best = Math.max(best, eighthFit(seg, 30 / b / hopSec, hist));
+    if (best < STAB_CLEAR) continue; // 박이 뚜렷하지 않은 구간(앰비언트·브레이크)은 판단하지 않는다
+    clear++;
+    let off = eighthFit(seg, P / 2, hist) < best * STAB_FIT; // ①
+    if (!off) {
+      // ② 창 첫 프레임 기준으로 옮긴 박·반박 자리 근처에 봉우리가 있는가
+      const g = foldScore(seg, bpm, hopSec);
+      const e = (((expect - (a % P) / P) % 1) + 1) % 1;
+      const bins = g.sm.length;
+      let peak = 0;
+      let onGrid = 0;
+      for (let b = 0; b < bins; b++) {
+        peak = Math.max(peak, g.sm[b]);
+        let d = ((b + 0.5) / bins - e) * 2; // 반박 주기 단위 → 박·반박 둘 다 정수
+        d = Math.abs(d - Math.round(d)) / 2;
+        if (d <= tolPh) onGrid = Math.max(onGrid, g.sm[b]);
+      }
+      off = onGrid < peak * STAB_ON_GRID;
+    }
+    if (!off) {
+      run = 0;
+      continue;
+    }
+    bad++;
+    if (run++ === 0) runStart = w;
+    if (run === STAB_RUN && unstableFrom === null) {
+      // 앞 창이 맞았다면 바뀐 지점은 두 창이 겹치는 구간 어딘가 → 그 가운데로 어림
+      unstableFrom = runStart === 0 ? 0 : (wins[runStart].a + (winF - hopF) / 2) * hopSec;
+    }
+  }
+  return { tempoStable: unstableFrom === null, unstableFrom, fitRatio: clear ? (clear - bad) / clear : 1 };
+}
+
 /**
  * @param {Float32Array} samples 모노 PCM
  * @param {number} sampleRate
- * @returns {{bpm:number, offset:number, confidence:number, duration:number, energies:number[], loopStart:number, loopEnd:number}}
+ * @returns {{bpm:number, offset:number, confidence:number, duration:number, energies:number[], loopStart:number, loopEnd:number, tempoStable:boolean, unstableFrom:number|null}}
+ *   tempoStable=false면 곡 일부(대략 unstableFrom초부터, 0이면 앞부분)가 격자와 맞지 않는다 — tempoStability 참고
  */
 export function analyzeBeats(samples, sampleRate, { sections = 12 } = {}) {
   const duration = samples.length / sampleRate;
@@ -188,7 +295,10 @@ export function analyzeBeats(samples, sampleRate, { sections = 12 } = {}) {
   const loopStart = offset;
   const beats = Math.floor((duration - offset) / period);
   const loopEnd = offset + beats * period;
-  const confidence = Math.max(0, Math.min(1, (best.score - 1.5) / 4));
   bpm = Math.round(bpm * 100) / 100;
-  return { bpm, offset, confidence, duration, energies: norm, loopStart, loopEnd };
+  // 격자 판정은 곡 전체(3분 이후 포함)에 대해, 게임이 실제로 쓰는 반올림된 BPM으로 한다
+  const { tempoStable, unstableFrom, fitRatio } = tempoStability(on, hopSec, bpm, offset);
+  // 접기 점수는 맞는 구간만으로도 높게 나오므로, 템포가 바뀌는 곡은 격자와 맞는 구간 비율만큼 낮춘다
+  const confidence = Math.max(0, Math.min(1, (best.score - 1.5) / 4)) * (tempoStable ? 1 : fitRatio);
+  return { bpm, offset, confidence, duration, energies: norm, loopStart, loopEnd, tempoStable, unstableFrom };
 }

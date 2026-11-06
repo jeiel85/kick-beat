@@ -7,6 +7,10 @@ import { totalStars } from '../save.js';
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const stars = (arr) => arr.map((s) => `<span class="star ${s ? 'on' : ''}">★</span>`).join('');
+const clock = (sec) => {
+  const t = Math.round(sec);
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+};
 
 export class Menus {
   constructor(root, app) {
@@ -115,6 +119,12 @@ export class Menus {
           ? `<div class="analysis">
               <div><b>${a.bpm.toFixed(2)}</b> BPM <small>신뢰도 ${(a.confidence * 100).toFixed(0)}%</small></div>
               <div><small>첫 박 ${(a.offset * 1000).toFixed(0)}ms · 길이 ${formatTime(a.duration)} · 방 ${d.rooms}개</small></div>
+              ${
+                a.tempoStable === false
+                  ? `<div class="warn">⚠ 템포가 일정하지 않은 곡 같습니다 — ${a.unstableFrom > 0 ? `약 ${clock(a.unstableFrom)}부터` : '곡 일부 구간에서'} 박 판정이 음악과 어긋날 수 있습니다.</div>
+                    <p class="fine">BPM 하나로 곡 전체를 판정하므로 중간에 템포가 바뀌거나 흔들리는 곡은 따라가지 못합니다. ÷2/×2로는 고쳐지지 않습니다.</p>`
+                  : ''
+              }
               <div class="row"><button data-act="bpm-mul" data-k="0.5">BPM ÷2</button><button data-act="bpm-mul" data-k="2">BPM ×2</button></div>
               <p class="fine">박이 어긋나 들리면 BPM을 절반/두 배로 바꿔 보세요. 너무 느린 곡은 두 배가 더 신납니다.</p>
             </div>
